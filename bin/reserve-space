@@ -1,0 +1,253 @@
+#!/usr/bin/env swift
+
+// reserve-space: manage a disk space reservation at ~/Library/Reserved Space/reserved
+// Uses macOS F_PREALLOCATE to hold real disk blocks without writing data.
+
+import Foundation
+
+func err(_ message: String, terminator: String = "\n") {
+  fputs(message + terminator, stderr)
+}
+
+// MARK: - Config
+
+let reservedSpaceDir =
+  FileManager.default.homeDirectoryForCurrentUser
+  .appendingPathComponent("Library/Reserved Space")
+let reservedFile = reservedSpaceDir.appendingPathComponent("reserved")
+
+// MARK: - Formatting
+
+func formatBytes(_ bytes: Int64) -> String {
+  let units: [(String, Int64)] = [
+    ("TB", 1 << 40),
+    ("GB", 1 << 30),
+    ("MB", 1 << 20),
+    ("KB", 1 << 10),
+  ]
+  for (unit, divisor) in units {
+    if abs(bytes) >= divisor * 9 / 10 {
+      return String(format: "%.1f %@", Double(bytes) / Double(divisor), unit)
+    }
+  }
+  return "\(bytes) B"
+}
+
+func parseBytes(_ s: String) -> Int64? {
+  let s = s.trimmingCharacters(in: .whitespaces).lowercased()
+  let suffixes: [(String, Int64)] = [
+    ("tb", 1 << 40), ("t", 1 << 40),
+    ("gb", 1 << 30), ("g", 1 << 30),
+    ("mb", 1 << 20), ("m", 1 << 20),
+    ("kb", 1 << 10), ("k", 1 << 10),
+    ("b", 1),
+  ]
+  for (suffix, mult) in suffixes {
+    if s.hasSuffix(suffix) {
+      let num = String(s.dropLast(suffix.count))
+      if let val = Double(num) { return Int64(val * Double(mult)) }
+    }
+  }
+  return Int64(s)
+}
+
+// MARK: - Disk info
+
+func getReservedSize() -> Int64 {
+  guard FileManager.default.fileExists(atPath: reservedFile.path) else { return 0 }
+  let attrs = try? FileManager.default.attributesOfItem(atPath: reservedFile.path)
+  return attrs?[.size] as? Int64 ?? 0
+}
+
+func getDiskInfo() -> (free: Int64, total: Int64) {
+  let queryPath =
+    FileManager.default.fileExists(atPath: reservedSpaceDir.path)
+    ? reservedSpaceDir.path
+    : FileManager.default.homeDirectoryForCurrentUser.path
+  guard let attrs = try? FileManager.default.attributesOfFileSystem(forPath: queryPath) else {
+    return (0, 0)
+  }
+  return (
+    attrs[.systemFreeSize] as? Int64 ?? 0,
+    attrs[.systemSize] as? Int64 ?? 0
+  )
+}
+
+// MARK: - Core: set reservation
+
+func setReservation(_ targetBytes: Int64) {
+  let target = max(0, targetBytes)
+  let fm = FileManager.default
+
+  if target == 0 {
+    if fm.fileExists(atPath: reservedFile.path) {
+      try? fm.removeItem(at: reservedFile)
+      err("Reservation cleared.")
+    } else {
+      err("No reservation to clear.")
+    }
+    return
+  }
+
+  try? fm.createDirectory(at: reservedSpaceDir, withIntermediateDirectories: true)
+
+  let fd = open(reservedFile.path, O_RDWR | O_CREAT, 0o644)
+  guard fd != -1 else {
+    err("Error: cannot open \(reservedFile.path): \(String(cString: strerror(errno)))")
+    exit(1)
+  }
+  defer { close(fd) }
+
+  let currentSize = getReservedSize()
+
+  if target > currentSize {
+    // Grow: allocate only the additional bytes needed (F_PEOFPOSMODE allocates from EOF)
+    var store = fstore_t()
+    store.fst_flags = UInt32(F_ALLOCATEALL)
+    store.fst_posmode = Int32(F_PEOFPOSMODE)
+    store.fst_offset = 0
+    store.fst_length = off_t(target - currentSize)
+    store.fst_bytesalloc = 0
+    if fcntl(fd, F_PREALLOCATE, &store) == -1 {
+      if errno == ENOSPC {
+        err("Error: not enough disk space to reserve \(formatBytes(target)).")
+        err("  Current reservation: \(formatBytes(currentSize))")
+        err("  Needed additional:   \(formatBytes(target - currentSize))")
+      } else {
+        err("Error: F_PREALLOCATE failed: \(String(cString: strerror(errno)))")
+      }
+      exit(1)
+    }
+  }
+
+  // Shrinking just needs ftruncate (blocks are freed automatically)
+  guard ftruncate(fd, off_t(target)) == 0 else {
+    err("Error: ftruncate failed: \(String(cString: strerror(errno)))")
+    exit(1)
+  }
+
+  err("Reserved: \(formatBytes(target)).")
+}
+
+// MARK: - Usage
+
+func printUsage() {
+  let name = URL(fileURLWithPath: CommandLine.arguments[0]).lastPathComponent
+  err(
+    """
+    Usage:
+      \(name)                      Show current reservation and disk status
+      \(name) SIZE                 Reserve exactly SIZE (e.g. 45g, 10gb, 500mb)
+      \(name) --reserve SIZE       Same as above
+      \(name) --free SIZE          Reserve so that SIZE is free (e.g. 10gb, or 20% of free w/o)
+      \(name) --clear              Remove reservation entirely
+    """)
+}
+
+// MARK: - Main
+
+func main() {
+  let args = Array(CommandLine.arguments.dropFirst())
+
+  func requireArg(_ flag: String, index: Int) -> String {
+    guard index < args.count else {
+      err("Error: \(flag) requires an argument")
+      exit(1)
+    }
+    return args[index]
+  }
+
+  if args.isEmpty {
+    let reserved = getReservedSize()
+    let (free, total) = getDiskInfo()
+    let freeWithout = free + reserved  // free if reservation were removed
+
+    func pct(_ n: Int64, of d: Int64) -> String {
+      String(format: "%.1f", d > 0 ? Double(n) * 100 / Double(d) : 0)
+    }
+    func rpad(_ s: String, _ width: Int) -> String {
+      s + String(repeating: " ", count: max(0, width - s.count))
+    }
+    func lpad(_ s: String, _ width: Int) -> String {
+      String(repeating: " ", count: max(0, width - s.count)) + s
+    }
+
+    if reserved > 0 {
+      let sizes = [reserved, freeWithout, free].map { formatBytes($0) }
+      let pcts = [
+        pct(reserved, of: freeWithout), pct(freeWithout, of: total), pct(free, of: total),
+      ]
+      let sizeW = sizes.map(\.count).max()!
+      let pctW = pcts.map(\.count).max()!
+      let totalStr = formatBytes(total)
+
+      err("Reserved: \(lpad(sizes[0], sizeW)) (\(lpad(pcts[0], pctW))% of free w/o)")
+      err("Free w/o: \(lpad(sizes[1], sizeW)) / \(totalStr) (\(lpad(pcts[1], pctW))%)")
+      err("Free w/:  \(lpad(sizes[2], sizeW)) / \(totalStr) (\(lpad(pcts[2], pctW))%)")
+    } else {
+      let freeStr = formatBytes(free)
+      let totalStr = formatBytes(total)
+      let freePct = pct(free, of: total)
+      err("Reserved:  none")
+      err("Free:      \(freeStr) / \(totalStr) (\(freePct)%)")
+    }
+    return
+  }
+
+  switch args[0] {
+  case "--help", "-h":
+    printUsage()
+
+  case "--clear":
+    setReservation(0)
+
+  case "--reserve":
+    let sizeStr = requireArg("--reserve", index: 1)
+    guard let size = parseBytes(sizeStr) else {
+      err("Error: cannot parse size '\(sizeStr)'")
+      exit(1)
+    }
+    setReservation(size)
+
+  case "--free":
+    let sizeStr = requireArg("--free", index: 1)
+    let (free, _) = getDiskInfo()
+    let reserved = getReservedSize()
+    let freeWithout = free + reserved
+    let targetFree: Int64
+    if sizeStr.hasSuffix("%") {
+      let pctStr = String(sizeStr.dropLast())
+      guard let pct = Double(pctStr), pct >= 0, pct <= 100 else {
+        err("Error: cannot parse percentage '\(sizeStr)'")
+        exit(1)
+      }
+      targetFree = Int64(Double(freeWithout) * pct / 100.0)
+    } else {
+      guard let size = parseBytes(sizeStr) else {
+        err("Error: cannot parse size '\(sizeStr)'")
+        exit(1)
+      }
+      targetFree = size
+    }
+    let newReserved = freeWithout - targetFree
+    if newReserved < 0 {
+      err(
+        "Warning: requested free (\(formatBytes(targetFree))) exceeds free w/o (\(formatBytes(freeWithout))). Clearing reservation instead."
+      )
+      setReservation(0)
+    } else {
+      setReservation(newReserved)
+    }
+
+  default:
+    if let size = parseBytes(args[0]) {
+      setReservation(size)
+    } else {
+      err("Error: unknown argument '\(args[0])'")
+      printUsage()
+      exit(1)
+    }
+  }
+}
+
+main()
