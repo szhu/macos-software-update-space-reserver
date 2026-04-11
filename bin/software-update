@@ -74,23 +74,49 @@ func run(_ args: [String], _ mode: RunMode = .capture, echo: Bool = false) -> (
     try? proc.run()
     proc.waitUntilExit()
     return ("", proc.terminationStatus)
-  case .capture, .tee:
+  case .capture:
     let pipe = Pipe()
     proc.standardOutput = pipe
     proc.standardError = pipe
-
-    var outputData = Data()
-    if mode == .tee {
-      pipe.fileHandleForReading.readabilityHandler = { handle in
-        let chunk = handle.availableData
-        outputData.append(chunk)
-        FileHandle.standardOutput.write(chunk)
-      }
-    }
     try? proc.run()
     proc.waitUntilExit()
-    pipe.fileHandleForReading.readabilityHandler = nil
-    if mode == .capture { outputData = pipe.fileHandleForReading.readDataToEndOfFile() }
+    let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
+    return (String(data: outputData, encoding: .utf8) ?? "", proc.terminationStatus)
+  case .tee:
+    // Use a PTY instead of a pipe so the child thinks it's writing to a TTY.
+    // `softwareupdate` switches to block-buffered output when stdout is a pipe,
+    // causing all output to arrive at once at the end instead of line by line.
+    let masterFd = posix_openpt(O_RDWR | O_NOCTTY)
+    grantpt(masterFd)
+    unlockpt(masterFd)
+    let slaveFd = open(ptsname(masterFd), O_RDWR)
+    // Raw mode: disable echo and line processing so output passes through unmodified.
+    var t = termios()
+    tcgetattr(masterFd, &t)
+    cfmakeraw(&t)
+    tcsetattr(masterFd, TCSANOW, &t)
+    let slaveFH = FileHandle(fileDescriptor: slaveFd, closeOnDealloc: true)
+    proc.standardInput = slaveFH
+    proc.standardOutput = slaveFH
+    proc.standardError = slaveFH
+    var outputData = Data()
+    let sema = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+      var buf = [UInt8](repeating: 0, count: 65536)
+      while true {
+        let n = Darwin.read(masterFd, &buf, buf.count)
+        if n <= 0 { break }
+        let chunk = Data(buf[0..<n])
+        outputData.append(chunk)
+        FileHandle.standardError.write(chunk)
+      }
+      sema.signal()
+    }
+    try? proc.run()
+    slaveFH.closeFile()  // Close slave in parent so master gets EOF when child exits.
+    proc.waitUntilExit()
+    sema.wait()
+    close(masterFd)
     return (String(data: outputData, encoding: .utf8) ?? "", proc.terminationStatus)
   }
 }
