@@ -58,9 +58,10 @@ func formatBytes(_ bytes: Int64) -> String {
 enum RunMode { case passthrough, capture, tee }
 
 @discardableResult
-func run(_ args: [String], _ mode: RunMode = .capture, echo: Bool = false) -> (
-  output: String, status: Int32
-) {
+func run(
+  _ args: [String], _ mode: RunMode = .capture, echo: Bool = false,
+  onLine: ((String) -> Bool)? = nil  // return true to kill the process
+) -> (output: String, status: Int32) {
   if echo {
     err("$ \(args.joined(separator: " "))")
   }
@@ -103,12 +104,24 @@ func run(_ args: [String], _ mode: RunMode = .capture, echo: Bool = false) -> (
     let sema = DispatchSemaphore(value: 0)
     DispatchQueue.global().async {
       var buf = [UInt8](repeating: 0, count: 65536)
+      var partial = ""  // Incomplete line carried between chunks.
       while true {
         let n = Darwin.read(masterFd, &buf, buf.count)
         if n <= 0 { break }
         let chunk = Data(buf[0..<n])
         outputData.append(chunk)
         FileHandle.standardError.write(chunk)
+        if let callback = onLine {
+          let text = partial + (String(data: chunk, encoding: .utf8) ?? "")
+          let lines = text.components(separatedBy: "\n")
+          partial = lines.last ?? ""
+          for line in lines.dropLast() {
+            if callback(line) {
+              proc.terminate()
+              break
+            }
+          }
+        }
       }
       sema.signal()
     }
@@ -208,11 +221,17 @@ func main() {
     }
   }
 
-  func runUpdate() -> (output: String, status: Int32) {
-    return run(["/usr/sbin/softwareupdate"] + args, .tee, echo: true)
+  // Run softwareupdate in tee mode, killing it as soon as it starts downloading
+  // (at which point we know there's no space error and the real install can proceed).
+  func runUpdateTee() -> (output: String, status: Int32) {
+    return run(
+      ["/usr/sbin/softwareupdate"] + args, .tee, echo: true,
+      onLine: { line in
+        line.hasPrefix("Downloading")
+      })
   }
 
-  var updateResult = runUpdate()
+  let updateResult = runUpdateTee()
   err("")
 
   // softwareupdate exits 0 even on "not enough disk space" — detect and retry.
@@ -227,17 +246,26 @@ func main() {
     err("The software update requires \(formatBytes(needed)). Freeing space and retrying...")
     freeSpaceForInstall(needed: needed)
     err("")
-    updateResult = runUpdate()
   }
 
-  // Restore immediately and clear the restore target.
-  if FileManager.default.fileExists(atPath: restoreToSizeFile.path) {
-    err("Restoring reservation to \(formatBytes(reserved))...")
-    runAsRealUser([reserveSpace, "\(reserved)"])
-    clearRestoreTarget()
+  // If we saw "Downloading" (killed by onLine) or freed space, run for real in passthrough.
+  let downloadingOrRetry =
+    updateResult.output.contains("Downloading") || updateResult.output.contains("GB is required")
+  if downloadingOrRetry {
+    // When run as a subprocess via Process(), softwareupdate prompts for a
+    // password via /dev/tty, which hangs silently since the prompt is hidden.
+    // `exec()`` replaces our process with softwareupdate so it runs as a direct
+    // child of the shell, allowing the password prompt to work correctly.
+    //
+    // Using `exec()` means that we can't do anything after the exec'd command
+    // finishes, but that's okay -- post-install reservation restore is handled
+    // by the LaunchAgent after reboot.
+    err("$ /usr/sbin/softwareupdate \(args.joined(separator: " "))")
+    let argv = (["/usr/sbin/softwareupdate"] + args).map { $0.withCString(strdup) } + [nil]
+    execv("/usr/sbin/softwareupdate", argv)
+    err("Error: execv failed: \(String(cString: strerror(errno)))")
+    exit(1)
   }
-
-  exit(updateResult.status)
 }
 
 main()
