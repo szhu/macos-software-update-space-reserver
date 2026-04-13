@@ -15,6 +15,7 @@ let reservedSpaceDir =
   FileManager.default.homeDirectoryForCurrentUser
   .appendingPathComponent("Library/Reserved Space")
 let reservedFile = reservedSpaceDir.appendingPathComponent("reserved")
+let restoreToSizeFile = reservedSpaceDir.appendingPathComponent("restore-to-size")
 
 // MARK: - Formatting
 
@@ -129,6 +130,32 @@ func setReservation(_ targetBytes: Int64) {
   err("Reserved: \(formatBytes(target)).")
 }
 
+// MARK: - Restore target
+
+func restoreSet() {
+  guard !FileManager.default.fileExists(atPath: restoreToSizeFile.path) else {
+    err("Warning: restore target already set (not overwriting).")
+    return
+  }
+  let size = getReservedSize()
+  try? "\(size)".write(to: restoreToSizeFile, atomically: true, encoding: .utf8)
+  err("Restore target set to \(formatBytes(size)).")
+}
+
+func restoreForget() {
+  try? FileManager.default.removeItem(at: restoreToSizeFile)
+}
+
+func restoreApply() {
+  guard let str = try? String(contentsOf: restoreToSizeFile, encoding: .utf8),
+    let size = Int64(str.trimmingCharacters(in: .whitespacesAndNewlines))
+  else {
+    err("Error: no restore target set.")
+    exit(1)
+  }
+  setReservation(size)
+}
+
 // MARK: - Usage
 
 func printUsage() {
@@ -141,6 +168,10 @@ func printUsage() {
       \(name) --reserve SIZE       Same as above
       \(name) --free SIZE          Reserve so that SIZE is free (e.g. 10gb, or 20% of free w/o)
       \(name) --clear              Remove reservation entirely
+      \(name) restore set          Save current size to restore-to-size file (no-op if already set)
+      \(name) restore forget       Delete the restore-to-size file
+      \(name) restore apply        Restore reservation from restore-to-size file
+      \(name) restore pop          Apply and forget
     """)
 }
 
@@ -197,6 +228,19 @@ func main() {
   switch args[0] {
   case "--help", "-h":
     printUsage()
+
+  case "restore":
+    let sub = args.count > 1 ? args[1] : ""
+    switch sub {
+    case "set":    restoreSet()
+    case "forget": restoreForget()
+    case "apply":  restoreApply()
+    case "pop":    restoreApply(); restoreForget()
+    default:
+      err("Error: unknown restore subcommand '\(sub)'")
+      printUsage()
+      exit(1)
+    }
 
   case "--clear":
     setReservation(0)

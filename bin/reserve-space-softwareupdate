@@ -49,7 +49,6 @@ let launchAgentLabel = "com.interestinglythere.reserve-space-restore"
 let launchAgentPlist = home.appendingPathComponent("Library/LaunchAgents/\(launchAgentLabel).plist")
 let logFile = home.appendingPathComponent(
   "Library/Logs/com.interestinglythere.reserve-space-restore.log")
-let restoreToSizeFile = home.appendingPathComponent("Library/Reserved Space/restore-to-size")
 
 // MARK: - Helpers
 
@@ -162,32 +161,16 @@ func installRestoreAgentIfNeeded() {
   try? FileManager.default.createDirectory(
     at: launchAgentPlist.deletingLastPathComponent(), withIntermediateDirectories: true)
 
-  let f = restoreToSizeFile.path
-  let command = "[ -f '\(f)' ] && '\(reserveSpace)' \"$(cat '\(f)')\" && rm -f '\(f)'"
-
   let plistData = try! PropertyListSerialization.data(
     fromPropertyList: [
       "Label": launchAgentLabel,
-      "ProgramArguments": ["/bin/sh", "-c", command],
+      "ProgramArguments": [reserveSpace, "restore", "pop"],
       "RunAtLoad": true,
       "StandardOutPath": logFile.path,
       "StandardErrorPath": logFile.path,
     ], format: .xml, options: 0)
   try? plistData.write(to: launchAgentPlist)
   err("LaunchAgent installed.")
-}
-
-// Write restore-to-size only if it doesn't already exist, so a failed run's target is preserved.
-func saveRestoreTarget(_ bytes: Int64) {
-  guard !FileManager.default.fileExists(atPath: restoreToSizeFile.path) else {
-    err("Restore target already set (protecting previous value).")
-    return
-  }
-  try? "\(bytes)".write(to: restoreToSizeFile, atomically: true, encoding: .utf8)
-}
-
-func clearRestoreTarget() {
-  try? FileManager.default.removeItem(at: restoreToSizeFile)
 }
 
 // MARK: - Main
@@ -212,7 +195,7 @@ func main() {
       exit(1)
     } else {
       err("Freeing \(formatBytes(shortfall)) from reservation...")
-      saveRestoreTarget(reserved)
+      runReserveSpace(["restore", "set"])
       runReserveSpace(["\(newReserved)"])
       installRestoreAgentIfNeeded()
     }
