@@ -1,8 +1,8 @@
 #!/usr/bin/env swift
 
-// software-update: wrapper around softwareupdate that manages disk space reservation.
+// reserve-space-softwareupdate: wrapper around softwareupdate that manages disk space reservation.
 //
-// Usage: software-update [softwareupdate options...]
+// Usage: reserve-space-softwareupdate [softwareupdate options...]
 //
 // For list-only operations (-l/--list), passes through directly.
 // For installs, frees enough reservation to cover update sizes, runs the update,

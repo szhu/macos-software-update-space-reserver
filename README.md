@@ -25,14 +25,14 @@ bin/reserve-space --free 20g  # reserve so that 20 GB remains free
 bin/reserve-space --clear     # remove the reservation
 ```
 
-## `software-update`
+## `reserve-space-softwareupdate`
 
 A wrapper around `softwareupdate` that automatically frees the reservation before installing, then restores it after reboot.
 
 ```sh
-bin/software-update --list
-bin/software-update --all --install
-sudo bin/software-update --all --install --restart  # --restart requires root
+bin/reserve-space-softwareupdate --list
+bin/reserve-space-softwareupdate --all --install
+sudo bin/reserve-space-softwareupdate --all --install --restart  # --restart requires root
 ```
 
 <details>
