@@ -1,0 +1,217 @@
+#!/usr/bin/env swift
+
+// software-update: wrapper around softwareupdate that manages disk space reservation.
+//
+// Usage: sudo software-update [softwareupdate options...]
+//
+// Must be run with sudo. For list-only operations (-l/--list), passes through directly.
+// For installs, frees enough reservation to cover update sizes, runs the update,
+// then restores the reservation (immediately if no restart needed, or via LaunchAgent
+// after reboot if a restart is required).
+
+import Foundation
+
+func err(_ message: String, terminator: String = "\n") {
+  fputs(message + terminator, stderr)
+}
+
+// MARK: - Config
+
+let scriptURL = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+let repoDir = scriptURL.deletingLastPathComponent()
+let reserveSpace = repoDir.appendingPathComponent("bin/reserve-space").path
+
+// Must be run as root via sudo so softwareupdate --restart works without a nested sudo prompt.
+guard getuid() == 0,
+  let sudoUserName = ProcessInfo.processInfo.environment["SUDO_USER"],
+  let pw = getpwnam(sudoUserName)
+else {
+  err("Error: run with sudo: sudo \(CommandLine.arguments[0]) ...")
+  exit(1)
+}
+
+let realUserName = String(cString: pw.pointee.pw_name)
+let realUID = pw.pointee.pw_uid
+let realGID = pw.pointee.pw_gid
+let realHome = URL(fileURLWithPath: String(cString: pw.pointee.pw_dir))
+
+let reservedFile = realHome.appendingPathComponent("Library/Reserved Space/reserved")
+let launchAgentLabel = "com.interestinglythere.reserve-space-restore"
+let launchAgentPlist =
+  realHome
+  .appendingPathComponent("Library/LaunchAgents/\(launchAgentLabel).plist")
+let logFile = realHome.appendingPathComponent(
+  "Library/Logs/com.interestinglythere.reserve-space-restore.log")
+let restoreToSizeFile = realHome.appendingPathComponent("Library/Reserved Space/restore-to-size")
+
+// MARK: - Helpers
+
+func formatBytes(_ bytes: Int64) -> String {
+  if bytes >= 1 << 30 {
+    return String(format: "%.1f GB", Double(bytes) / Double(1 << 30))
+  } else if bytes >= 1 << 20 {
+    return String(format: "%.0f MB", Double(bytes) / Double(1 << 20))
+  }
+  return "\(bytes) B"
+}
+
+enum RunMode { case passthrough, capture, tee }
+
+@discardableResult
+func run(_ args: [String], _ mode: RunMode = .capture, echo: Bool = false) -> (
+  output: String, status: Int32
+) {
+  if echo {
+    err("$ \(args.joined(separator: " "))")
+  }
+
+  let proc = Process()
+  proc.executableURL = URL(fileURLWithPath: args[0])
+  proc.arguments = Array(args.dropFirst())
+
+  switch mode {
+  case .passthrough:
+    try? proc.run()
+    proc.waitUntilExit()
+    return ("", proc.terminationStatus)
+  case .capture, .tee:
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = pipe
+
+    var outputData = Data()
+    if mode == .tee {
+      pipe.fileHandleForReading.readabilityHandler = { handle in
+        let chunk = handle.availableData
+        outputData.append(chunk)
+        FileHandle.standardOutput.write(chunk)
+      }
+    }
+    try? proc.run()
+    proc.waitUntilExit()
+    pipe.fileHandleForReading.readabilityHandler = nil
+    if mode == .capture { outputData = pipe.fileHandleForReading.readDataToEndOfFile() }
+    return (String(data: outputData, encoding: .utf8) ?? "", proc.terminationStatus)
+  }
+}
+
+// Run a command as the real (non-root) user.
+@discardableResult
+func runAsRealUser(_ args: [String], _ mode: RunMode = .passthrough) -> (
+  output: String, status: Int32
+) {
+  run(["/usr/bin/sudo", "-u", realUserName] + args, mode)
+}
+
+func getReservedBytes() -> Int64 {
+  guard FileManager.default.fileExists(atPath: reservedFile.path) else { return 0 }
+  let attrs = try? FileManager.default.attributesOfItem(atPath: reservedFile.path)
+  return attrs?[.size] as? Int64 ?? 0
+}
+
+func getFreeBytes() -> Int64 {
+  let attrs = try? FileManager.default.attributesOfFileSystem(forPath: realHome.path)
+  return attrs?[.systemFreeSize] as? Int64 ?? 0
+}
+
+// MARK: - LaunchAgent
+
+// The LaunchAgent is a permanent fixture: it runs on every login and restores the reservation
+// if restore-to-size exists, then deletes that file. Installing it is a one-time operation.
+func installRestoreAgentIfNeeded() {
+  guard !FileManager.default.fileExists(atPath: launchAgentPlist.path) else { return }
+
+  try? FileManager.default.createDirectory(
+    at: launchAgentPlist.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+  let f = restoreToSizeFile.path
+  let command = "[ -f '\(f)' ] && '\(reserveSpace)' \"$(cat '\(f)')\" && rm -f '\(f)'"
+
+  let plistData = try! PropertyListSerialization.data(
+    fromPropertyList: [
+      "Label": launchAgentLabel,
+      "ProgramArguments": ["/bin/sh", "-c", command],
+      "RunAtLoad": true,
+      "StandardOutPath": logFile.path,
+      "StandardErrorPath": logFile.path,
+    ], format: .xml, options: 0)
+  try? plistData.write(to: launchAgentPlist)
+  _ = launchAgentPlist.path.withCString { chown($0, realUID, realGID) }
+  err("LaunchAgent installed.")
+}
+
+// Write restore-to-size only if it doesn't already exist, so a failed run's target is preserved.
+func saveRestoreTarget(_ bytes: Int64) {
+  guard !FileManager.default.fileExists(atPath: restoreToSizeFile.path) else {
+    err("Restore target already set (protecting previous value).")
+    return
+  }
+  try? "\(bytes)".write(to: restoreToSizeFile, atomically: true, encoding: .utf8)
+  _ = restoreToSizeFile.path.withCString { chown($0, realUID, realGID) }
+}
+
+func clearRestoreTarget() {
+  try? FileManager.default.removeItem(at: restoreToSizeFile)
+}
+
+// MARK: - Main
+
+func main() {
+  let args = Array(CommandLine.arguments.dropFirst())
+  let reserved = getReservedBytes()
+
+  func freeSpaceForInstall(needed: Int64) {
+    let free = getFreeBytes()
+    err("Current free: \(formatBytes(free)) | Reserved: \(formatBytes(reserved))")
+
+    let shortfall = needed - free
+    let newReserved = max(0, reserved - shortfall)
+
+    if shortfall <= 0 {
+      err("Sufficient free space available.")
+    } else if reserved == 0 {
+      err(
+        "Need \(formatBytes(shortfall)) more space but no reservation to free. Please free disk space manually."
+      )
+      exit(1)
+    } else {
+      err("Freeing \(formatBytes(shortfall)) from reservation...")
+      saveRestoreTarget(reserved)
+      runAsRealUser([reserveSpace, "\(newReserved)"])
+      installRestoreAgentIfNeeded()
+    }
+  }
+
+  func runUpdate() -> (output: String, status: Int32) {
+    return run(["/usr/sbin/softwareupdate"] + args, .tee, echo: true)
+  }
+
+  var updateResult = runUpdate()
+  err("")
+
+  // softwareupdate exits 0 even on "not enough disk space" — detect and retry.
+  let spaceErrorRegex = try! NSRegularExpression(pattern: #"a total of ([\d.]+) GB is required"#)
+  if let match = spaceErrorRegex.firstMatch(
+    in: updateResult.output,
+    range: NSRange(updateResult.output.startIndex..., in: updateResult.output)),
+    let range = Range(match.range(at: 1), in: updateResult.output),
+    let gbNeeded = Double(updateResult.output[range])
+  {
+    let needed = Int64(gbNeeded * Double(1 << 30))
+    err("The software update requires \(formatBytes(needed)). Freeing space and retrying...")
+    freeSpaceForInstall(needed: needed)
+    err("")
+    updateResult = runUpdate()
+  }
+
+  // Restore immediately and clear the restore target.
+  if FileManager.default.fileExists(atPath: restoreToSizeFile.path) {
+    err("Restoring reservation to \(formatBytes(reserved))...")
+    runAsRealUser([reserveSpace, "\(reserved)"])
+    clearRestoreTarget()
+  }
+
+  exit(updateResult.status)
+}
+
+main()
