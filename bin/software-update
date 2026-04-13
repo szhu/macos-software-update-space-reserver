@@ -2,12 +2,12 @@
 
 // software-update: wrapper around softwareupdate that manages disk space reservation.
 //
-// Usage: sudo software-update [softwareupdate options...]
+// Usage: software-update [softwareupdate options...]
 //
-// Must be run with sudo. For list-only operations (-l/--list), passes through directly.
+// For list-only operations (-l/--list), passes through directly.
 // For installs, frees enough reservation to cover update sizes, runs the update,
-// then restores the reservation (immediately if no restart needed, or via LaunchAgent
-// after reboot if a restart is required).
+// then restores the reservation via LaunchAgent after reboot if a restart is required.
+// Run with sudo if softwareupdate requires it (e.g. --restart).
 
 import Foundation
 
@@ -21,28 +21,35 @@ let scriptURL = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinks
 let repoDir = scriptURL.deletingLastPathComponent()
 let reserveSpace = repoDir.appendingPathComponent("bin/reserve-space").path
 
-// Must be run as root via sudo so softwareupdate --restart works without a nested sudo prompt.
-guard getuid() == 0,
+// If running as root via sudo, use the real user's home for all paths.
+// Otherwise, use the current user's home.
+let home: URL
+let runReserveSpace: ([String]) -> Void
+if getuid() == 0,
   let sudoUserName = ProcessInfo.processInfo.environment["SUDO_USER"],
   let pw = getpwnam(sudoUserName)
-else {
-  err("Error: run with sudo: sudo \(CommandLine.arguments[0]) ...")
-  exit(1)
+{
+  home = URL(fileURLWithPath: String(cString: pw.pointee.pw_dir))
+  let realUID = pw.pointee.pw_uid
+  let realGID = pw.pointee.pw_gid
+  let realUserName = String(cString: pw.pointee.pw_name)
+  runReserveSpace = { args in
+    run(["/usr/bin/sudo", "-u", realUserName, reserveSpace] + args)
+    // Fix ownership of any files written by reserve-space as root.
+    let reservedDir = home.appendingPathComponent("Library/Reserved Space").path
+    _ = reservedDir.withCString { chown($0, realUID, realGID) }
+  }
+} else {
+  home = FileManager.default.homeDirectoryForCurrentUser
+  runReserveSpace = { args in run([reserveSpace] + args) }
 }
 
-let realUserName = String(cString: pw.pointee.pw_name)
-let realUID = pw.pointee.pw_uid
-let realGID = pw.pointee.pw_gid
-let realHome = URL(fileURLWithPath: String(cString: pw.pointee.pw_dir))
-
-let reservedFile = realHome.appendingPathComponent("Library/Reserved Space/reserved")
+let reservedFile = home.appendingPathComponent("Library/Reserved Space/reserved")
 let launchAgentLabel = "com.interestinglythere.reserve-space-restore"
-let launchAgentPlist =
-  realHome
-  .appendingPathComponent("Library/LaunchAgents/\(launchAgentLabel).plist")
-let logFile = realHome.appendingPathComponent(
+let launchAgentPlist = home.appendingPathComponent("Library/LaunchAgents/\(launchAgentLabel).plist")
+let logFile = home.appendingPathComponent(
   "Library/Logs/com.interestinglythere.reserve-space-restore.log")
-let restoreToSizeFile = realHome.appendingPathComponent("Library/Reserved Space/restore-to-size")
+let restoreToSizeFile = home.appendingPathComponent("Library/Reserved Space/restore-to-size")
 
 // MARK: - Helpers
 
@@ -134,14 +141,6 @@ func run(
   }
 }
 
-// Run a command as the real (non-root) user.
-@discardableResult
-func runAsRealUser(_ args: [String], _ mode: RunMode = .passthrough) -> (
-  output: String, status: Int32
-) {
-  run(["/usr/bin/sudo", "-u", realUserName] + args, mode)
-}
-
 func getReservedBytes() -> Int64 {
   guard FileManager.default.fileExists(atPath: reservedFile.path) else { return 0 }
   let attrs = try? FileManager.default.attributesOfItem(atPath: reservedFile.path)
@@ -149,7 +148,7 @@ func getReservedBytes() -> Int64 {
 }
 
 func getFreeBytes() -> Int64 {
-  let attrs = try? FileManager.default.attributesOfFileSystem(forPath: realHome.path)
+  let attrs = try? FileManager.default.attributesOfFileSystem(forPath: home.path)
   return attrs?[.systemFreeSize] as? Int64 ?? 0
 }
 
@@ -175,7 +174,6 @@ func installRestoreAgentIfNeeded() {
       "StandardErrorPath": logFile.path,
     ], format: .xml, options: 0)
   try? plistData.write(to: launchAgentPlist)
-  _ = launchAgentPlist.path.withCString { chown($0, realUID, realGID) }
   err("LaunchAgent installed.")
 }
 
@@ -186,7 +184,6 @@ func saveRestoreTarget(_ bytes: Int64) {
     return
   }
   try? "\(bytes)".write(to: restoreToSizeFile, atomically: true, encoding: .utf8)
-  _ = restoreToSizeFile.path.withCString { chown($0, realUID, realGID) }
 }
 
 func clearRestoreTarget() {
@@ -216,7 +213,7 @@ func main() {
     } else {
       err("Freeing \(formatBytes(shortfall)) from reservation...")
       saveRestoreTarget(reserved)
-      runAsRealUser([reserveSpace, "\(newReserved)"])
+      runReserveSpace(["\(newReserved)"])
       installRestoreAgentIfNeeded()
     }
   }
